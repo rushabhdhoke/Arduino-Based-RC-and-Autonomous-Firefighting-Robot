@@ -1,6 +1,6 @@
 # Arduino-Based-RC-and-Autonomous-Firefighting-Robot
 
-![Firefighting Robot](./assets/robot-demo.jpg)
+![Firefighting Robot](./assets/RC-Circuit-Board.jpg)
 
 ## 🚒 Project Overview
 
