@@ -1,0 +1,417 @@
+#include <Servo.h>
+
+// ——— User‐input start cell [0…7] ———
+#define START_CELL 2   // ← change this to your starting column (0 = leftmost, 7 = rightmost)
+
+// ——— Pin definitions ———
+// Motor driver pins
+#define FR_DIR1 22
+#define FR_DIR2 24
+#define FR_PWM   9
+#define FL_DIR1 26
+#define FL_DIR2 28
+#define FL_PWM  10
+#define RR_DIR1  5
+#define RR_DIR2  6
+#define RR_PWM  11
+#define RL_DIR1  7
+#define RL_DIR2  8
+#define RL_PWM  12
+
+// Ultrasonic front-facing
+#define US_TRIG 43
+#define US_ECHO 41
+
+// Dual IR “fire” detectors
+#define IR_LEFT_PIN  35
+#define IR_RIGHT_PIN 34
+
+// QTI reflectance sensors (front bottom)
+const int QTI_L_PIN     = A1;
+const int QTI_R_PIN     = A2;
+const int QTI_THRESHOLD = 84;   // calibrated: ≥84 = white, <84 = black
+
+
+// Ladder servos
+//#define LADDER_LEFT_SERVO_PIN   30
+//#define LADDER_RIGHT_SERVO_PIN  31
+
+// ——— Constants & thresholds ———
+const int    SPEED         = 100;      // drive speed
+const int    STOP_DISTANCE = 15;       // cm for ultrasonic
+const unsigned long CELL_TIME_MS = 1200;   // fallback cell drive timeout
+const unsigned long TURN_90_MS   =  550;   // pivot 90° time
+
+// ——— Grid & A* data structures ———
+const uint8_t N = 8;
+enum CellState { UNKNOWN, FREE, OCCUPIED };
+CellState grid[N][N];
+
+enum Dir { NORTH=0, EAST=1, SOUTH=2, WEST=3 };
+int8_t dx[4] = {  0, 1,  0, -1 };
+int8_t dy[4] = { -1, 0,  1,  0 };
+
+struct Node {
+  uint8_t x,y;
+  int16_t g,h;
+  Node*   parent;
+};
+Node nodes[N][N];
+Node* openSet[N*N];
+uint8_t openCount;
+bool inClosed[N*N];
+
+Node* pathList[N*N];
+uint8_t pathLen, pathIdx;
+
+// ——— Robot state ———
+uint8_t curX = START_CELL, curY = N-1;  
+Dir     heading = NORTH;
+
+// ——— Ladder & IR ———
+//Servo ladderL, ladderR;
+//bool  fightSideIsLeft = false;
+
+// ——— FSM ———
+enum State { EXPLORE, FOLLOWING, FIGHT, DONE };
+State state = EXPLORE;
+
+
+// helper inline tests
+inline bool onLineLeft()  { return analogRead(QTI_L_PIN) >= QTI_THRESHOLD; }
+inline bool onLineRight() { return analogRead(QTI_R_PIN) >= QTI_THRESHOLD; }
+
+
+// ——— Low‐level motor helpers ———
+void FR_fwd(int s){ digitalWrite(FR_DIR1,LOW); digitalWrite(FR_DIR2,HIGH); analogWrite(FR_PWM,s); }
+void FR_bck(int s){ digitalWrite(FR_DIR1,HIGH);digitalWrite(FR_DIR2,LOW);  analogWrite(FR_PWM,s); }
+void FL_fwd(int s){ digitalWrite(FL_DIR1,LOW); digitalWrite(FL_DIR2,HIGH); analogWrite(FL_PWM,s); }
+void FL_bck(int s){ digitalWrite(FL_DIR1,HIGH);digitalWrite(FL_DIR2,LOW);  analogWrite(FL_PWM,s); }
+void RR_fwd(int s){ digitalWrite(RR_DIR1,LOW); digitalWrite(RR_DIR2,HIGH); analogWrite(RR_PWM,s); }
+void RR_bck(int s){ digitalWrite(RR_DIR1,HIGH);digitalWrite(RR_DIR2,LOW);  analogWrite(RR_PWM,s); }
+void RL_fwd(int s){ digitalWrite(RL_DIR1,LOW); digitalWrite(RL_DIR2,HIGH); analogWrite(RL_PWM,s); }
+void RL_bck(int s){ digitalWrite(RL_DIR1,HIGH);digitalWrite(RL_DIR2,LOW);  analogWrite(RL_PWM,s); }
+
+void stopMotors(){
+  analogWrite(FR_PWM,0);
+  analogWrite(FL_PWM,0);
+  analogWrite(RR_PWM,0);
+  analogWrite(RL_PWM,0);
+}
+void goAdvance(int v){
+  FR_fwd(v); FL_fwd(v);
+  RR_fwd(v); RL_fwd(v);
+}
+void goBack(int v){
+  FR_bck(v); FL_bck(v);
+  RR_bck(v); RL_bck(v);
+}
+void turnLeftPivot(int v){
+  FL_bck(v); RL_bck(v);
+  FR_fwd(v); RR_fwd(v);
+}
+void turnRightPivot(int v){
+  FL_fwd(v); RL_fwd(v);
+  FR_bck(v); RR_bck(v);
+}
+
+// ——— Read ultrasonic ———
+long readUltrasonicCM(){
+  digitalWrite(US_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(US_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(US_TRIG, LOW);
+  long dur = pulseIn(US_ECHO, HIGH, 30000);
+  return dur ? dur/29/2 : 999;
+}
+
+// ——— QTI crossing detection ———
+bool qtiCrossed(){
+  unsigned long start = millis();
+
+  // 1) wait until *either* sensor sees the white line
+  while (!onLineLeft() && !onLineRight()) {
+    if (millis() - start > CELL_TIME_MS * 2) return false;  // timeout
+  }
+
+  // 2) now wait until *both* sensors are back on black floor
+  while ( onLineLeft() || onLineRight() ) {
+    if (millis() - start > CELL_TIME_MS * 3) break;         // safety cutoff
+  }
+
+  return true;
+}
+
+
+// ——— Pivot to face a direction ———
+void turnTo(Dir want){
+  int diff = (want - heading + 4) % 4;
+  if(diff == 1){
+    turnRightPivot(SPEED); delay(TURN_90_MS);
+  } else if(diff == 2){
+    turnRightPivot(SPEED); delay(2*TURN_90_MS);
+  } else if(diff == 3){
+    turnLeftPivot(SPEED);  delay(TURN_90_MS);
+  }
+  stopMotors();
+  heading = want;
+}
+
+// ——— Move forward one grid cell ———
+void moveOneCell(){
+  goAdvance(SPEED);
+  unsigned long t0 = millis();
+  while(!qtiCrossed()){
+    if(millis()-t0 > CELL_TIME_MS*2) break;
+  }
+  stopMotors();
+  // update position
+  switch(heading){
+    case NORTH: curY--; break;
+    case SOUTH: curY++; break;
+    case EAST:  curX++; break;
+    case WEST:  curX--; break;
+  }
+}
+
+// ——— Scan all 4 directions for obstacles ———
+void scanSurroundings(){
+  Dir orig = heading;
+  for(int d=0; d<4; d++){
+    Dir want = Dir(d);
+    turnTo(want);
+    delay(200);
+    long dist = readUltrasonicCM();
+    int nx = int(curX) + dx[d];
+    int ny = int(curY) + dy[d];
+    if(nx>=0 && ny>=0 && nx< N && ny< N){
+      grid[nx][ny] = (dist < STOP_DISTANCE) ? OCCUPIED : FREE;
+    }
+    // optional: detect IR here to set fightSideIsLeft
+  }
+  turnTo(orig);
+}
+
+// ——— A* helpers ———
+int heuristic(uint8_t x, uint8_t y, uint8_t gx, uint8_t gy){
+  return abs(int(gx)-int(x)) + abs(int(gy)-int(y));
+}
+
+Node* popLowestF(){
+  uint8_t best = 0;
+  for(uint8_t i=1; i<openCount; i++){
+    if(openSet[i]->g + openSet[i]->h
+      < openSet[best]->g + openSet[best]->h){
+      best = i;
+    }
+  }
+  Node* ret = openSet[best];
+  openSet[best] = openSet[--openCount];
+  return ret;
+}
+
+bool runAstar(uint8_t sx, uint8_t sy, uint8_t gx, uint8_t gy){
+  openCount = 0;
+  memset(inClosed, 0, sizeof(inClosed));
+  // init nodes
+  for(uint8_t x=0; x<N; x++){
+    for(uint8_t y=0; y<N; y++){
+      nodes[x][y].x = x;
+      nodes[x][y].y = y;
+      nodes[x][y].g = 0x7FFF;
+      nodes[x][y].parent = nullptr;
+    }
+  }
+  Node* start = &nodes[sx][sy];
+  start->g = 0;
+  start->h = heuristic(sx,sy,gx,gy);
+  openSet[openCount++] = start;
+
+  while(openCount){
+    Node* cur = popLowestF();
+    if(cur->x==gx && cur->y==gy) break;
+    inClosed[cur->x + N*cur->y] = true;
+    for(int k=0; k<4; k++){
+      int nx = int(cur->x) + dx[k];
+      int ny = int(cur->y) + dy[k];
+      if(nx<0||ny<0||nx>=N||ny>=N) continue;
+      if(grid[nx][ny] == OCCUPIED) continue;
+      if(inClosed[nx + N*ny]) continue;
+      Node* nb = &nodes[nx][ny];
+      int16_t tg = cur->g + 1;
+      if(tg < nb->g){
+        nb->g = tg;
+        nb->h = heuristic(nx,ny,gx,gy);
+        nb->parent = cur;
+        openSet[openCount++] = nb;
+      }
+    }
+  }
+
+  Node* goal = &nodes[gx][gy];
+  if(!goal->parent) return false;
+  // rebuild path
+  pathLen = 0;
+  for(Node* p = goal; p; p = p->parent){
+    pathList[pathLen++] = p;
+  }
+  // reverse
+  for(uint8_t i=0; i<pathLen/2; i++){
+    Node* tmp = pathList[i];
+    pathList[i] = pathList[pathLen-1-i];
+    pathList[pathLen-1-i] = tmp;
+  }
+  pathIdx = 1; // skip start
+  return true;
+}
+
+// ——— Drive to nearest bottom‐corner ———
+void gotoCorner(uint8_t startIdx){
+  // face east
+  turnTo(EAST);
+  if(startIdx > (N-1)/2){
+    // go to X=7
+    while(curX < N-1){
+      moveOneCell();
+    }
+    curX = N-1;
+  } else {
+    // go to X=0
+    turnTo(WEST);
+    while(curX > 0){
+      moveOneCell();
+    }
+    curX = 0;
+  }
+  // face north
+  turnTo(NORTH);
+  curY = N-1;
+}
+
+// ——— “Fight” routine ———
+//void doFight(){
+//  stopMotors();
+//  if(fightSideIsLeft){
+//    ladderL.write(90);
+//  } else {
+//    ladderR.write(90);
+//  }
+//  state = DONE;
+//}
+
+// ——— Setup & Loop ———
+void setup(){
+  Serial.begin(115200);
+
+  // Motor pins
+  pinMode(FR_DIR1, OUTPUT); pinMode(FR_DIR2, OUTPUT); pinMode(FR_PWM, OUTPUT);
+  pinMode(FL_DIR1, OUTPUT); pinMode(FL_DIR2, OUTPUT); pinMode(FL_PWM, OUTPUT);
+  pinMode(RR_DIR1, OUTPUT); pinMode(RR_DIR2, OUTPUT); pinMode(RR_PWM, OUTPUT);
+  pinMode(RL_DIR1, OUTPUT); pinMode(RL_DIR2, OUTPUT); pinMode(RL_PWM, OUTPUT);
+  stopMotors();
+
+  // Sensors
+  pinMode(US_TRIG, OUTPUT);
+  pinMode(US_ECHO, INPUT);
+  pinMode(IR_LEFT_PIN,  INPUT_PULLUP);
+  pinMode(IR_RIGHT_PIN, INPUT_PULLUP);
+  pinMode(QTI_L_PIN,  INPUT);
+  pinMode(QTI_R_PIN, INPUT);
+
+  // Servos
+  //ladderL.attach(LADDER_LEFT_SERVO_PIN);
+  //ladderR.attach(LADDER_RIGHT_SERVO_PIN);
+  //ladderL.write(0);
+  //ladderR.write(0);
+
+  // init grid
+  for(uint8_t x=0; x<N; x++){
+    for(uint8_t y=0; y<N; y++){
+      grid[x][y] = UNKNOWN;
+    }
+  }
+  // bottom row free
+  for(uint8_t x=0; x<N; x++){
+    grid[x][N-1] = FREE;
+  }
+
+  // Self‐localize to bottom corner
+  curX = START_CELL;
+  curY = N-1;
+  heading = NORTH;
+  gotoCorner(START_CELL);
+
+  // Now you can begin EXPLORE/A* from (curX,curY) at a known corner
+}
+
+void loop(){
+  // IR pre-empt
+  //if(state != FIGHT){
+  //  if(digitalRead(IR_LEFT_PIN)==LOW || digitalRead(IR_RIGHT_PIN)==LOW){
+      //fightSideIsLeft = (digitalRead(IR_LEFT_PIN)==LOW);
+  //    state = FIGHT;
+  //  }
+  
+
+  // Main FSM
+  switch(state){
+    case EXPLORE: {
+      // find next UNKNOWN
+      bool found=false;
+      uint8_t gx=0, gy=0;
+      for(uint8_t y=0; y<N && !found; y++){
+        for(uint8_t x=0; x<N && !found; x++){
+          if(grid[x][y] == UNKNOWN){
+            gx = x; gy = y; found = true;
+          }
+        }
+      }
+      if(!found){
+        state = DONE;
+        break;
+      }
+      grid[gx][gy] = FREE;
+      if(runAstar(curX,curY,gx,gy)){
+        state = FOLLOWING;
+      } else {
+        state = DONE;
+      }
+      break;
+    }
+
+    case FOLLOWING: {
+      if(pathIdx >= pathLen){
+        state = EXPLORE;
+        break;
+      }
+      Node* wp = pathList[pathIdx++];
+      int dx_c = int(wp->x) - int(curX);
+      int dy_c = int(wp->y) - int(curY);
+      Dir want = heading;
+      if(dx_c>0)      want = EAST;
+      else if(dx_c<0) want = WEST;
+      else if(dy_c>0) want = SOUTH;
+      else if(dy_c<0) want = NORTH;
+
+      turnTo(want);
+      moveOneCell();
+      scanSurroundings();
+
+      // re-plan if obstacle
+      if(grid[wp->x][wp->y] == OCCUPIED){
+        state = EXPLORE;
+      }
+      break;
+    }
+
+    //case FIGHT:
+    //  doFight();
+    //  break;
+
+    case DONE:
+      stopMotors();
+      while(true) { delay(1000); }
+      break;
+  }
+}
