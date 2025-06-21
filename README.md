@@ -38,7 +38,7 @@ This is a hybrid RC/autonomous firefighting platform built on an Arduino Mega 25
 | Buzzer                     | D53 (PB0/SS)                 |
 | Motor Drivers (L298N)      | PWM & DIR pins D5–D10, D22–D28 |
 
-> **See** [`/docs/wiring.md`](docs/wiring.md) for a full Fritzing diagram and breadboard layout.
+> **See** [`/docs/wiring.md`](docs/wiring-diag.md) for a full Fritzing diagram and breadboard layout.
 
 ---
 
